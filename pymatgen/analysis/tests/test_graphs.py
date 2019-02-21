@@ -330,6 +330,26 @@ from    to  to_image
         for n in range(len(nio_sg)):
             self.assertEqual(nio_sg.get_coordination_of_site(n), 6)
 
+        # test with MinimumDistanceNN
+        sites = [[x, y, z] for x, y, z
+                 in product([0], [0.2, -0.2], [0.2, -0.2])]
+        lodin = Structure(
+            [5, 0, 0, 0, 5, 0, 0, 0, 5],
+            ['I']*len(sites),
+            sites
+        )
+        mdnn = MinimumDistanceNN()
+
+        bonded_lodin = mdnn.get_bonded_structure(lodin)
+        supercell_from_bonded_lodin = bonded_lodin * (1, 1, 2)
+        images = set([data['to_jimage'] for from_index, to_index, data
+                      in supercell_from_bonded_lodin.graph.edges.data()])
+
+        supercell_lodin = lodin * (1, 1, 2)
+        bonded_lodin_from_supercell = mdnn.get_bonded_structure(supercell_lodin)
+        images_ref = set([data['to_jimage'] for from_index, to_index, data
+                          in bonded_lodin_from_supercell.graph.edges.data()])
+        self.assertEqual(len(images), len(images_ref))
 
     @unittest.skipIf(not (which('neato') and which('fdp')), "graphviz executables not present")
     def test_draw(self):
