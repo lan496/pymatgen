@@ -331,25 +331,20 @@ from    to  to_image
             self.assertEqual(nio_sg.get_coordination_of_site(n), 6)
 
         # test with MinimumDistanceNN
-        sites = [[x, y, z] for x, y, z
-                 in product([0], [0.2, -0.2], [0.2, -0.2])]
-        lodin = Structure(
-            [5, 0, 0, 0, 5, 0, 0, 0, 5],
-            ['I']*len(sites),
-            sites
-        )
+        dimer = Structure([8, 0, 0, 0, 8, 0, 0, 0, 8], ['I'] * 2,
+                          [[0, 0, 0], [0.1, 0, 0]])
+        scaling_matrix = [[2, 1, 0], [0, 3, 0], [0, 1, 1]]
         mdnn = MinimumDistanceNN()
 
-        bonded_lodin = mdnn.get_bonded_structure(lodin)
-        supercell_from_bonded_lodin = bonded_lodin * (1, 1, 2)
-        images = set([data['to_jimage'] for from_index, to_index, data
-                      in supercell_from_bonded_lodin.graph.edges.data()])
+        bonded_dimer = mdnn.get_bonded_structure(dimer)
+        super_from_bonded_dimer = bonded_dimer * scaling_matrix
+        n_dimers_in_super_from_bonded_dimer = len(list(nx.weakly_connected_component_subgraphs(super_from_bonded_dimer.graph)))
 
-        supercell_lodin = lodin * (1, 1, 2)
-        bonded_lodin_from_supercell = mdnn.get_bonded_structure(supercell_lodin)
-        images_ref = set([data['to_jimage'] for from_index, to_index, data
-                          in bonded_lodin_from_supercell.graph.edges.data()])
-        self.assertEqual(len(images), len(images_ref))
+        super_dimer = dimer * scaling_matrix
+        bonded_super_dimer = mdnn.get_bonded_structure(super_dimer)
+        n_dimers_in_bonded_dimer_supercell = len(list(nx.weakly_connected_component_subgraphs(bonded_super_dimer.graph)))
+        self.assertEqual(n_dimers_in_super_from_bonded_dimer,
+                         n_dimers_in_bonded_dimer_supercell)
 
     @unittest.skipIf(not (which('neato') and which('fdp')), "graphviz executables not present")
     def test_draw(self):
