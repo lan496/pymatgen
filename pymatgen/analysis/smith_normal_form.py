@@ -143,6 +143,62 @@ class SNF:
         self.A_[:, axis1] += self.A_[:, axis2] * k
 
 
+class SupercellHash:
+    """
+    perfect hash function for checking if two lattice points are equivalent up to supercell translation.
+    see the detailed in Gus L. W. Hart and Rodney W. Forcade,
+    "Algorithm for generating derivative structures," Phys. Rev. B 77 224115, (26 June 2008)
+
+    Parameters
+    ----------
+    scale_matrix: array, (3, 3)
+    """
+
+    def __init__(self, scale_matrix):
+        self.scale_matrix = scale_matrix
+
+        D, left, right = SNF(self.scale_matrix).get_smith_normal_form()
+        self.D = D
+        self.left = left
+        self.right = right
+        self.right_inv = np.linalg.inv(self.right)
+
+    @property
+    def shape(self):
+        return tuple(self.D.diagonal())
+
+    def hash_image(self, indexes, return_supercell_jimage=False):
+        """
+        hash lattice point
+
+        Parameters
+        ----------
+        indexes: array
+        return_supercell_jimage: if True, return jimage in supercell
+
+        Returns
+        -------
+        remainder: array
+            It it equivalent to be symmetrically equal up to supercell translation
+            to match remainder for two lattice point
+        (Optional) supercell_jiamge: array
+        """
+        factor = np.dot(self.right.T, np.array(indexes))
+        remainder = np.around(np.mod(factor, np.array(self.shape))).astype(int)
+        if return_supercell_jimage:
+            supercell_jimage = (np.dot(self.right.T, indexes) - remainder) / self.D.diagonal()
+            supercell_jimage = np.dot(self.left.T, supercell_jimage)
+            supercell_jimage = np.around(supercell_jimage).astype(int)
+
+            return remainder, supercell_jimage
+        else:
+            return remainder
+
+    def unhash_factor(self, factor):
+        indexes = np.dot(self.right_inv.T, np.array(factor))
+        return indexes
+
+
 def get_nonzero_min_abs(A, s):
     """
     return idx = argmin_{i, j} abs(A[i, j]) s.t. (i >= s and j >= s and A[i, j] != 0)

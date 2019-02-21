@@ -8,18 +8,17 @@ import subprocess
 import numpy as np
 import os.path
 import copy
-from itertools import combinations
+from itertools import combinations, product
 
 from pymatgen.core import Structure, Lattice, PeriodicSite, Molecule
 from pymatgen.core.structure import FunctionalGroups
-from pymatgen.util.coord import lattice_points_in_supercell
 from pymatgen.vis.structure_vtk import EL_COLORS
+from pymatgen.analysis.smith_normal_form import SupercellHash
 
 from monty.json import MSONable
 from monty.os.path import which
 from operator import itemgetter
 from collections import namedtuple, defaultdict
-from scipy.spatial import KDTree
 from scipy.stats import describe
 
 import networkx as nx
@@ -982,197 +981,55 @@ class StructureGraph(MSONable):
         :return:
         """
 
-        # Developer note: a different approach was also trialed, using
-        # a simple Graph (instead of MultiDiGraph), with node indices
-        # representing both site index and periodic image. Here, the
-        # number of nodes != number of sites in the Structure. This
-        # approach has many benefits, but made it more difficult to
-        # keep the graph in sync with its corresponding Structure.
-
-        # Broadly, it would be easier to multiply the Structure
-        # *before* generating the StructureGraph, but this isn't
-        # possible when generating the graph using critic2 from
-        # charge density.
-
-        # Multiplication works by looking for the expected position
-        # of an image node, and seeing if that node exists in the
-        # supercell. If it does, the edge is updated. This is more
-        # computationally expensive than just keeping track of the
-        # which new lattice images present, but should hopefully be
-        # easier to extend to a general 3x3 scaling matrix.
-
         # code adapted from Structure.__mul__
         scale_matrix = np.array(scaling_matrix, np.int16)
         if scale_matrix.shape != (3, 3):
             scale_matrix = np.array(scale_matrix * np.eye(3), np.int16)
-        else:
-            # TODO: test __mul__ with full 3x3 scaling matrices
-            raise NotImplementedError('Not tested with 3x3 scaling matrices yet.')
+
+        # make supercell
+        shash = SupercellHash(scale_matrix)
+        lattice_unhash = np.dot(shash.right_inv, self.structure.lattice.matrix).T
+
         new_lattice = Lattice(np.dot(scale_matrix, self.structure.lattice.matrix))
-
-        f_lat = lattice_points_in_supercell(scale_matrix)
-        c_lat = new_lattice.get_cartesian_coords(f_lat)
-
         new_sites = []
-        new_graphs = []
 
-        for v in c_lat:
-
-            # create a map of nodes from original graph to its image
-            mapping = {n: n + len(new_sites) for n in range(len(self.structure))}
-
-            for idx, site in enumerate(self.structure):
-
-                s = PeriodicSite(site.species_and_occu, site.coords + v,
+        for cell_hash in product(*[range(d) for d in shash.D.diagonal()]):
+            for site in self.structure:
+                coords = site.coords + np.dot(lattice_unhash, np.array(cell_hash))
+                s = PeriodicSite(site.species_and_occu, coords,
                                  new_lattice, properties=site.properties,
                                  coords_are_cartesian=True, to_unit_cell=False)
-
                 new_sites.append(s)
 
-            new_graphs.append(nx.relabel_nodes(self.graph, mapping, copy=True))
-
+        # create new StructureGraph
         new_structure = Structure.from_sites(new_sites)
+        sg = StructureGraph.with_empty_graph(new_structure)
+        hash_shape = [*shash.shape, self.structure.num_sites]
 
-        # merge all graphs into one big graph
-        new_g = nx.MultiDiGraph()
-        for new_graph in new_graphs:
-            new_g = nx.union(new_g, new_graph)
+        for cell_hash in product(*[range(d) for d in shash.D.diagonal()]):
+            for i, site in enumerate(self.structure):
+                image_i = shash.unhash_factor(cell_hash)
+                from_index = np.ravel_multi_index(tuple(cell_hash) + (i, ), hash_shape)
 
-        edges_to_remove = []  # tuple of (u, v, k)
-        edges_to_add = []  # tuple of (u, v, attr_dict)
+                for j in self.graph.neighbors(i):
+                    for _, data in self.graph.get_edge_data(i, j).items():
+                        image_j = image_i + np.array(data['to_jimage'])
+                        cell_hash_j, to_jimage = shash.hash_image(image_j,
+                                                                  return_supercell_jimage=True)
 
-        # list of new edges inside supercell
-        # for duplicate checking
-        edges_inside_supercell = [{u, v} for u, v, d in new_g.edges(data=True)
-                                  if d['to_jimage'] == (0, 0, 0)]
-        new_periodic_images = []
+                        to_index = np.ravel_multi_index(tuple(cell_hash_j) + (j, ), hash_shape)
 
-        orig_lattice = self.structure.lattice
+                        edge_properties = {}
+                        for key, val in data.items():
+                            if all([key != k for k in ['from_jimage', 'to_jimage', 'weight']]):
+                                edge_properties[key] = val
 
-        # use k-d tree to match given position to an
-        # existing Site in Structure
-        kd_tree = KDTree(new_structure.cart_coords)
-
-        # tolerance in Å for sites to be considered equal
-        # this could probably be a lot smaller
-        tol = 0.05
-
-        for u, v, k, d in new_g.edges(keys=True, data=True):
-
-            to_jimage = d['to_jimage']  # for node v
-
-            # reduce unnecessary checking
-            if to_jimage != (0, 0, 0):
-
-                # get index in original site
-                n_u = u % len(self.structure)
-                n_v = v % len(self.structure)
-
-                # get fractional co-ordinates of where atoms defined
-                # by edge are expected to be, relative to original
-                # lattice (keeping original lattice has
-                # significant benefits)
-                v_image_frac = np.add(self.structure[n_v].frac_coords, to_jimage)
-                u_frac = self.structure[n_u].frac_coords
-
-                # using the position of node u as a reference,
-                # get relative Cartesian co-ordinates of where
-                # atoms defined by edge are expected to be
-                v_image_cart = orig_lattice.get_cartesian_coords(v_image_frac)
-                u_cart = orig_lattice.get_cartesian_coords(u_frac)
-                v_rel = np.subtract(v_image_cart, u_cart)
-
-                # now retrieve position of node v in
-                # new supercell, and get asgolute Cartesian
-                # co-ordinates of where atoms defined by edge
-                # are expected to be
-                v_expec = new_structure[u].coords + v_rel
-
-                # now search in new structure for these atoms
-                # query returns (distance, index)
-                v_present = kd_tree.query(v_expec)
-                v_present = v_present[1] if v_present[0] <= tol else None
-
-                # check if image sites now present in supercell
-                # and if so, delete old edge that went through
-                # periodic boundary
-                if v_present is not None:
-
-                    new_u = u
-                    new_v = v_present
-                    new_d = d.copy()
-
-                    # node now inside supercell
-                    new_d['to_jimage'] = (0, 0, 0)
-
-                    edges_to_remove.append((u, v, k))
-
-                    # make sure we don't try to add duplicate edges
-                    # will remove two edges for everyone one we add
-                    if {new_u, new_v} not in edges_inside_supercell:
-
-                        # normalize direction
-                        if new_v < new_u:
-                            new_u, new_v = new_v, new_u
-
-                        edges_inside_supercell.append({new_u, new_v})
-                        edges_to_add.append((new_u, new_v, new_d))
-
-                else:
-
-                    # want to find new_v such that we have
-                    # full periodic boundary conditions
-                    # so that nodes on one side of supercell
-                    # are connected to nodes on opposite side
-
-                    v_expec_frac = new_structure.lattice.get_fractional_coords(v_expec)
-
-                    # find new to_jimage
-                    # use np.around to fix issues with finite precision leading to incorrect image
-                    v_expec_image = np.around(v_expec_frac, decimals=3)
-                    v_expec_image = v_expec_image - v_expec_image%1
-
-                    v_expec_frac = np.subtract(v_expec_frac, v_expec_image)
-                    v_expec = new_structure.lattice.get_cartesian_coords(v_expec_frac)
-                    v_present = kd_tree.query(v_expec)
-                    v_present = v_present[1] if v_present[0] <= tol else None
-
-                    if v_present is not None:
-
-                        new_u = u
-                        new_v = v_present
-                        new_d = d.copy()
-                        new_to_jimage = tuple(map(int, v_expec_image))
-
-                        # normalize direction
-                        if new_v < new_u:
-                            new_u, new_v = new_v, new_u
-                            new_to_jimage = tuple(np.multiply(-1, d['to_jimage']).astype(int))
-
-                        new_d['to_jimage'] = new_to_jimage
-
-                        edges_to_remove.append((u, v, k))
-
-                        if (new_u, new_v, new_to_jimage) not in new_periodic_images:
-                            edges_to_add.append((new_u, new_v, new_d))
-                            new_periodic_images.append((new_u, new_v, new_to_jimage))
-
-        logger.debug("Removing {} edges, adding {} new edges.".format(len(edges_to_remove),
-                                                                      len(edges_to_add)))
-
-        # add/delete marked edges
-        for edges_to_remove in edges_to_remove:
-            new_g.remove_edge(*edges_to_remove)
-        for (u, v, d) in edges_to_add:
-            new_g.add_edge(u, v, **d)
-
-        # return new instance of StructureGraph with supercell
-        d = {"@module": self.__class__.__module__,
-             "@class": self.__class__.__name__,
-             "structure": new_structure.as_dict(),
-             "graphs": json_graph.adjacency_data(new_g)}
-
-        sg = StructureGraph.from_dict(d)
+                        if 'weight' in data:
+                            sg.add_edge(from_index, to_index, to_jimage=to_jimage,
+                                        weight=data['weight'], **edge_properties)
+                        else:
+                            sg.add_edge(from_index, to_index, to_jimage=to_jimage,
+                                        **edge_properties)
 
         return sg
 
